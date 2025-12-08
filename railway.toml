@@ -1,0 +1,43 @@
+[build]
+builder = "NIXPACKS"
+
+[phases.setup]
+aptPkgs = [
+  "wget",
+  "ca-certificates",
+  "libglib2.0-0",
+  "libnss3",
+  "libnspr4",
+  "libxcomposite1",
+  "libxdamage1",
+  "libxrandr2",
+  "libxkbcommon0",
+  "libdrm2",
+  "libgbm1",
+  "libasound2",
+  "libatk1.0-0",
+  "libatk-bridge2.0-0",
+  "libcups2",
+  "libpango-1.0-0",
+  "libpangocairo-1.0-0",
+  "libx11-6",
+  "libx11-xcb1",
+  "libxcb1",
+  "libxss1",
+  "libxext6",
+  "fonts-liberation",
+  "libappindicator3-1",
+  "libatk1.0-data",
+  "libcairo2",
+  "libgdk-pixbuf2.0-0",
+  "libgtk-3-0"
+]
+
+[phases.install]
+cmds = [
+  "npm install",
+  "npx playwright install --with-deps chromium"
+]
+
+[start]
+cmd = "npm start"
