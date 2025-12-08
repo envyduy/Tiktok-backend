@@ -76,6 +76,10 @@ const performScrape = async (username, isHeadless) => {
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-dev-tools',
+                '--disable-renderer-backgrounding',
                 '--disable-infobars',
                 '--window-size=1280,800',
                 isHeadless ? '' : '--start-maximized'
