@@ -6,7 +6,7 @@ import path from 'path';
 import cron from 'node-cron';
 
 const app = express();
-const PORT = 3001;
+const PORT = 80;
 const SESSION_FILE = 'tiktok_session.json';
 const CACHE_FILE = 'tiktok_data_cache.json'; // Stores Covers AND Latest Video Data
 const HISTORY_FILE = 'tiktok_view_history.json'; // Stores Baseline for Midnight Reset
