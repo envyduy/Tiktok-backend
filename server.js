@@ -6,7 +6,7 @@ import path from 'path';
 import cron from 'node-cron';
 
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 const SESSION_FILE = 'tiktok_session.json';
 const CACHE_FILE = 'tiktok_data_cache.json'; // Stores Covers AND Latest Video Data
 const HISTORY_FILE = 'tiktok_view_history.json'; // Stores Baseline for Midnight Reset
@@ -335,6 +335,7 @@ app.get('/views', async (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Backend Server running on http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend Server running on port ${PORT}`);
 });
+
