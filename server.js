@@ -187,9 +187,10 @@ async function performScrape(username) {
 
 // --- CRON JOBS ---
 
-// Cron Job 1: Midnight Reset (00:00)
-cron.schedule('0 0 * * *', async () => {
-    console.log('\n[CRON] Starting Daily Midnight Update...');
+// Cron Job 1: 7:00 AM Reset (Vietnam Time)
+// Configured with timezone "Asia/Ho_Chi_Minh" to ensure correct daily reset.
+cron.schedule('0 7 * * *', async () => {
+    console.log('\n[CRON] Starting Daily Morning Update (7:00 AM VN)...');
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
     const globalHistory = loadJson(HISTORY_FILE);
@@ -202,12 +203,17 @@ cron.schedule('0 0 * * *', async () => {
         const result = await performScrape(user);
         if (result.videos.length > 0) {
             const newHistoryMap = {};
+            // This REPLACES the old history with current views.
+            // effectively "resetting" the counter for the new day.
             result.videos.forEach(v => { newHistoryMap[v.id] = v.numericViews; });
             globalHistory[user] = newHistoryMap;
         }
     }
     saveJson(HISTORY_FILE, globalHistory);
-    console.log('[CRON] Daily update complete.');
+    console.log('[CRON] Daily update complete (Baseline Reset).');
+}, {
+    scheduled: true,
+    timezone: "Asia/Ho_Chi_Minh"
 });
 
 // Cron Job 2: Every 30 Minutes
@@ -268,6 +274,7 @@ app.get('/views', async (req, res) => {
         let change = 0;
         let changePercent = 0;
 
+        // Calculate change based on the baseline set at midnight (or first load)
         if (previousViews !== undefined) {
             change = video.numericViews - previousViews;
             if (previousViews > 0) changePercent = (change / previousViews) * 100;
@@ -297,7 +304,6 @@ app.get('/views', async (req, res) => {
         videos: finalVideos
     });
 });
-
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Backend Server running on port ${PORT}`);
     console.log(`Mode: TikWM API Aggregator (Bypasses Railway CAPTCHA)`);
