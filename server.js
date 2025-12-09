@@ -1,33 +1,47 @@
 import express from 'express';
-import { chromium } from 'playwright';
 import cors from 'cors';
 import fs from 'fs';
 import path from 'path';
 import cron from 'node-cron';
+import dotenv from 'dotenv';
+import fetch from 'node-fetch';
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const SESSION_FILE = 'tiktok_session.json';
-const CACHE_FILE = 'tiktok_data_cache.json'; // Stores Covers AND Latest Video Data
-const HISTORY_FILE = 'tiktok_view_history.json'; // Stores Baseline for Midnight Reset
-const WATCHED_USERS_FILE = 'watched_users.json'; // List of users
-const TARGET_VIDEO_COUNT = 200;
+
+// --- CONSTANTS ---
+const HISTORY_FILE = 'tiktok_view_history.json';
+const WATCHED_USERS_FILE = 'watched_users.json';
+const TARGET_VIDEO_COUNT = 200; 
 
 app.use(cors());
+app.use(express.json());
 
-// --- Helper Functions ---
+// --- Helper Functions: Utils ---
 
 const parseViewCount = (str) => {
-  if (!str) return 0;
-  if (typeof str === 'number') return str; 
-  const s = str.toString().toUpperCase();
-  const multiplier = s.endsWith('M') ? 1000000 : 
-                     s.endsWith('K') ? 1000 : 1;
-  const num = parseFloat(s.replace(/[^\d.]/g, ''));
-  return Math.floor(num * multiplier);
+    if (!str) return 0;
+    // Handle raw numbers (TikWM returns raw numbers mostly)
+    if (typeof str === 'number') return str;
+    
+    const s = str.toString().toUpperCase().trim();
+    if (s.includes('M')) {
+        return parseFloat(s.replace('M', '')) * 1000000;
+    }
+    if (s.includes('K')) {
+        return parseFloat(s.replace('K', '')) * 1000;
+    }
+    return parseInt(s.replace(/,/g, ''), 10) || 0;
 };
 
-// Load/Save JSON helpers
+const formatViewCount = (num) => {
+    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toString();
+};
+
 const loadJson = (filename) => {
     if (fs.existsSync(filename)) {
         try {
@@ -60,282 +74,231 @@ const addToWatchedUsers = (username) => {
     }
 };
 
-/**
- * Core scraping logic function
- */
-const performScrape = async (username, isHeadless) => {
-    console.log(`[Scraper] Launching browser (Headless: ${isHeadless})...`);
-    
-    let browser = null;
-    let videos = [];
-    let sessionData = null;
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    try {
-        browser = await chromium.launch({
-            headless: isHeadless,
-            args: [
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-                '--disable-infobars',
-                '--window-size=1280,800',
-                isHeadless ? '' : '--start-maximized'
-            ].filter(Boolean)
-        });
+// --- SCRAPING LOGIC (TIKWM AGGREGATOR) ---
+// Docs Reference: Public endpoints from TikWM/TikMate usually follow /api/user/posts
 
-        const contextOptions = {
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            viewport: { width: 1280, height: 800 },
-            locale: 'en-US',
-            timezoneId: 'America/New_York',
-            permissions: ['geolocation'],
-            javaScriptEnabled: true,
-        };
+async function fetchVideosFromTikWM(username) {
+    let allVideos = [];
+    let cursor = 0;
+    let hasMore = true;
+    let loops = 0;
+    const MAX_LOOPS = 10; // Prevent infinite loops
 
-        if (fs.existsSync(SESSION_FILE)) {
-            try {
-                const savedSession = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf8'));
-                contextOptions.storageState = savedSession;
-            } catch(e) {}
-        }
+    console.log(`[TikWM] Fetching videos for @${username} (Target: ${TARGET_VIDEO_COUNT})...`);
 
-        const context = await browser.newContext(contextOptions);
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
-
-        const page = await context.newPage();
-        const url = `https://www.tiktok.com/@${username}`;
+    while (allVideos.length < TARGET_VIDEO_COUNT && hasMore && loops < MAX_LOOPS) {
+        loops++;
+        // Endpoint: https://www.tikwm.com/api/user/posts?unique_id={username}&count={count}&cursor={cursor}
+        const url = `https://www.tikwm.com/api/user/posts?unique_id=${username}&count=33&cursor=${cursor}`;
         
         try {
-            const timeout = isHeadless ? 30000 : 60000;
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeout });
-        } catch (e) {
-            console.log('[Scraper] Navigation timeout or interrupt.');
-        }
-
-        // Improved Scroll Logic
-        let noNewVideosCount = 0;
-        let previousVideoCount = 0;
-
-        for (let i = 0; i < 50; i++) { // Slightly reduced loops for speed
-            const currentCount = await page.locator('[data-e2e="user-post-item"]').count();
-            if (currentCount >= TARGET_VIDEO_COUNT) break;
-
-            if (currentCount === previousVideoCount && currentCount > 0) {
-                noNewVideosCount++;
-                await page.evaluate(() => window.scrollBy(0, window.innerHeight * 2));
-                await page.waitForTimeout(1500);
-                if (noNewVideosCount >= 5) break;
-            } else {
-                noNewVideosCount = 0;
-                await page.evaluate(() => window.scrollBy(0, window.innerHeight));
-                await page.waitForTimeout(800); 
+            const response = await fetch(url);
+            const contentType = response.headers.get("content-type");
+            
+            if (!response.ok) {
+                console.error(`[TikWM] Error status: ${response.status}`);
+                break;
             }
-            previousVideoCount = currentCount;
+
+            if (!contentType || !contentType.includes("application/json")) {
+                console.error(`[TikWM] Invalid content type. Probably rate limited.`);
+                break;
+            }
+
+            const json = await response.json();
+
+            if (json.code !== 0) {
+                // Code 0 usually means success
+                console.warn(`[TikWM] API returned code ${json.code}: ${json.msg}`);
+                // If user not found or private
+                if (loops === 1) throw new Error("User not found or Private");
+                break;
+            }
+
+            const data = json.data;
+            const videos = data.videos || [];
+            
+            if (videos.length === 0) {
+                hasMore = false;
+                break;
+            }
+
+            allVideos = allVideos.concat(videos);
+            console.log(`[TikWM] Loop ${loops}: Got ${videos.length} videos. Total: ${allVideos.length}`);
+
+            if (data.hasMore && data.cursor) {
+                cursor = data.cursor;
+                // Important: Sleep to avoid rate limiting from the aggregator
+                await sleep(1000); 
+            } else {
+                hasMore = false;
+            }
+
+        } catch (e) {
+            console.error(`[TikWM] Exception:`, e.message);
+            if (loops === 1) throw e;
+            break;
         }
-        
-        // Final Jiggle
-        await page.evaluate(() => window.scrollBy(0, -600)); 
-        await page.waitForTimeout(500); 
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await page.waitForTimeout(1000); 
-
-        // Extract
-        const domVideos = await page.$$eval('[data-e2e="user-post-item"]', (elements) => {
-            return elements.map(el => {
-                const linkEl = el.querySelector('a');
-                const viewEl = el.querySelector('[data-e2e="video-views"]');
-                const imgEl = el.querySelector('img'); 
-                
-                let id = '';
-                if (linkEl && linkEl.href) {
-                    const match = linkEl.href.match(/video\/(\d+)/);
-                    if (match) id = match[1];
-                }
-
-                let coverSrc = '';
-                if (imgEl) {
-                    coverSrc = imgEl.src;
-                    if ((!coverSrc || coverSrc.length < 50) && imgEl.srcset) coverSrc = imgEl.srcset.split(',')[0].split(' ')[0];
-                }
-                
-                return {
-                    id: id,
-                    url: linkEl ? linkEl.href : '',
-                    cover: coverSrc,
-                    views: viewEl ? viewEl.innerText : '0'
-                };
-            });
-        });
-
-        if (domVideos.length > 0) {
-            videos = domVideos.slice(0, TARGET_VIDEO_COUNT).map((v, i) => ({
-                id: v.id || `vid_${i}`,
-                url: v.url,
-                cover: v.cover,
-                views: v.views,
-                numericViews: parseViewCount(v.views)
-            }));
-            sessionData = await context.storageState();
-        }
-
-    } catch (e) {
-        console.error(`[Scraper] Error:`, e.message);
-    } finally {
-        if (browser) await browser.close();
     }
 
-    return { videos, sessionData };
-};
+    // --- NORMALIZE DATA ---
+    // Map TikWM format to our App format
+    const normalized = allVideos.map(v => {
+        const playCount = v.play_count || 0;
+        return {
+            id: v.video_id || v.id, // TikWM usually uses video_id
+            url: `https://www.tiktok.com/@${username}/video/${v.video_id}`,
+            cover: v.cover || v.origin_cover, // Web compatible URL
+            views: formatViewCount(playCount),
+            numericViews: playCount
+        };
+    });
 
-// --- Cron Job 1: Midnight Reset (00:00) ---
+    // Deduplicate based on ID just in case
+    const uniqueVideos = [];
+    const seen = new Set();
+    for (const v of normalized) {
+        if (!seen.has(v.id)) {
+            seen.add(v.id);
+            uniqueVideos.push(v);
+        }
+    }
+
+    return uniqueVideos.slice(0, TARGET_VIDEO_COUNT);
+}
+
+// --- MAIN SCRAPE HANDLER ---
+
+async function performScrape(username) {
+    try {
+        // Remove '@' if present
+        const cleanUser = username.replace('@', '');
+        const videos = await fetchVideosFromTikWM(cleanUser);
+        
+        return { videos, userId: cleanUser };
+    } catch (e) {
+        console.error(`[Scraper] Exception: ${e.message}`);
+        // Return friendly error
+        return { error: e.message, videos: [] };
+    }
+}
+
+// --- CRON JOBS ---
+
+// Cron Job 1: Midnight Reset (00:00)
 cron.schedule('0 0 * * *', async () => {
     console.log('\n[CRON] Starting Daily Midnight Update...');
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
-    if (users.length === 0) return;
-
     const globalHistory = loadJson(HISTORY_FILE);
 
     for (const user of users) {
         console.log(`[CRON-Mid] Updating baseline for: ${user}`);
-        try {
-            const result = await performScrape(user, true);
-            if (result.videos.length > 0) {
-                const newHistoryMap = {};
-                result.videos.forEach(v => { newHistoryMap[v.id] = v.numericViews; });
-                globalHistory[user] = newHistoryMap;
-            }
-        } catch (e) { console.error(`[CRON-Mid] Error ${user}`, e); }
+        // Add random delay to prevent rate limits
+        await sleep(Math.random() * 5000 + 2000);
+        
+        const result = await performScrape(user);
+        if (result.videos.length > 0) {
+            const newHistoryMap = {};
+            result.videos.forEach(v => { newHistoryMap[v.id] = v.numericViews; });
+            globalHistory[user] = newHistoryMap;
+        }
     }
     saveJson(HISTORY_FILE, globalHistory);
     console.log('[CRON] Daily update complete.');
 });
 
-// --- Cron Job 2: Every 30 Minutes Update (*/30 * * * *) ---
+// Cron Job 2: Every 30 Minutes
 cron.schedule('*/30 * * * *', async () => {
     console.log('\n[CRON] Starting 30-Minute Data Refresh...');
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
-    if (users.length === 0) return;
-
-    const globalCache = loadJson(CACHE_FILE);
-
-    for (const user of users) {
-        console.log(`[CRON-30m] Refreshing data for: ${user}`);
-        try {
-            const result = await performScrape(user, true);
-            if (result.videos.length > 0) {
-                // We update the CACHE so when users visit, it's fast (optional) or just to keep data fresh
-                // In this architecture, we primarily use the cache for covers, but let's store latest videos too
-                // Note: The /views endpoint usually does a fresh scrape, but we can optimize later.
-                // For now, this ensures the server is active and cookies stay fresh.
-                
-                // Update Cache with covers
-                const userCache = globalCache[user] || {};
-                result.videos.forEach(v => {
-                    if (v.cover && v.cover.length > 50) userCache[v.id] = v.cover;
-                });
-                globalCache[user] = userCache;
-                console.log(`[CRON-30m] Refreshed ${user}.`);
-            }
-        } catch (e) { console.error(`[CRON-30m] Error ${user}`, e); }
-    }
-    saveJson(CACHE_FILE, globalCache);
-    console.log('[CRON] 30-Minute refresh complete.');
+    console.log(`[CRON-30m] Active users: ${users.length}.`);
 });
 
-// --- Routes ---
+// --- ROUTES ---
 
 app.get('/watched', (req, res) => {
     const data = loadJson(WATCHED_USERS_FILE);
     res.json(data.list || []);
 });
 
+app.delete('/watched/:username', (req, res) => {
+    const { username } = req.params;
+    const data = loadJson(WATCHED_USERS_FILE);
+    if (data.list) {
+        data.list = data.list.filter(u => u !== username);
+        saveJson(WATCHED_USERS_FILE, data);
+        return res.json({ success: true, message: `Removed ${username}` });
+    }
+    res.status(404).json({ error: "List empty" });
+});
+
 app.get('/views', async (req, res) => {
-  const { user } = req.query;
-  if (!user) return res.status(400).json({ error: 'Username required' });
+    const { user } = req.query;
+    if (!user) return res.status(400).json({ error: 'Username required' });
 
-  const targetUsername = user.toString().replace('@', '').trim();
-  console.log(`\n[Scraper] === Processing: ${targetUsername} ===`);
+    const targetUsername = user.toString().replace('@', '').trim();
+    
+    addToWatchedUsers(targetUsername);
 
-  addToWatchedUsers(targetUsername);
+    const globalHistory = loadJson(HISTORY_FILE);
+    const userHistory = globalHistory[targetUsername] || {}; 
 
-  const globalCache = loadJson(CACHE_FILE);
-  const globalHistory = loadJson(HISTORY_FILE);
-  const userCache = globalCache[targetUsername] || {}; 
-  const userHistory = globalHistory[targetUsername] || {}; 
+    // CALL API
+    const result = await performScrape(targetUsername);
 
-  let finalVideos = [];
-  
-  // Try headless scrape first
-  const result = await performScrape(targetUsername, true); 
-  finalVideos = result.videos;
-  if (result.sessionData) fs.writeFileSync(SESSION_FILE, JSON.stringify(result.sessionData, null, 2));
+    if (result.error && (result.error.includes("User not found") || result.error.includes("Private"))) {
+        return res.status(404).json({ error: "User not found or Account is Private" });
+    }
+    
+    if (result.videos.length === 0 && result.error) {
+        return res.status(500).json({ error: result.error || "Failed to fetch from TikTok" });
+    }
 
-  // If failed, try visible (rarely needed if cron keeps cookies fresh)
-  if (finalVideos.length === 0) {
-      console.log('[Scraper] Retry visible...');
-      const resVis = await performScrape(targetUsername, false); 
-      finalVideos = resVis.videos;
-  }
+    let finalVideos = result.videos;
+    const isFirstTime = Object.keys(userHistory).length === 0;
+    const newHistoryMap = isFirstTime ? {} : null;
 
-  if (finalVideos.length > 0) {
-      let isFirstTime = Object.keys(userHistory).length === 0;
-      const newHistoryMap = isFirstTime ? {} : null;
+    // Process Change (Compare against history)
+    finalVideos = finalVideos.map(video => {
+        const previousViews = userHistory[video.id];
+        let change = 0;
+        let changePercent = 0;
 
-      finalVideos = finalVideos.map(video => {
-          // Cache logic
-          let effectiveCover = video.cover;
-          if ((!effectiveCover || effectiveCover.length < 50) && userCache[video.id]) {
-              effectiveCover = userCache[video.id];
-          } else if (effectiveCover && effectiveCover.length > 50) {
-              userCache[video.id] = effectiveCover;
-          }
+        if (previousViews !== undefined) {
+            change = video.numericViews - previousViews;
+            if (previousViews > 0) changePercent = (change / previousViews) * 100;
+            else if (change > 0) changePercent = 100;
+        }
 
-          // History Logic
-          const previousViews = userHistory[video.id];
-          let change = 0;
-          let changePercent = 0;
+        if (isFirstTime && newHistoryMap) {
+            newHistoryMap[video.id] = video.numericViews;
+        }
 
-          if (previousViews !== undefined) {
-              change = video.numericViews - previousViews;
-              if (previousViews > 0) changePercent = (change / previousViews) * 100;
-              else if (change > 0) changePercent = 100; 
-          }
+        return { 
+            ...video, 
+            change: change,
+            changePercent: parseFloat(changePercent.toFixed(2))
+        };
+    });
 
-          if (isFirstTime && newHistoryMap) newHistoryMap[video.id] = video.numericViews;
+    if (isFirstTime) {
+        globalHistory[targetUsername] = newHistoryMap;
+        saveJson(HISTORY_FILE, globalHistory);
+    }
 
-          return { 
-              ...video, 
-              cover: effectiveCover,
-              change: change,
-              changePercent: parseFloat(changePercent.toFixed(2))
-          };
-      });
-
-      globalCache[targetUsername] = userCache;
-      saveJson(CACHE_FILE, globalCache);
-
-      if (isFirstTime) {
-          globalHistory[targetUsername] = newHistoryMap;
-          saveJson(HISTORY_FILE, globalHistory);
-      }
-  }
-
-  if (finalVideos.length === 0) {
-      return res.status(500).json({ error: 'Failed to scrape. Try again.' });
-  }
-
-  res.json({
-    user: targetUsername,
-    totalVideos: finalVideos.length,
-    scrapedAt: new Date().toISOString(),
-    videos: finalVideos
-  });
+    res.json({
+        user: targetUsername,
+        totalVideos: finalVideos.length,
+        scrapedAt: new Date().toISOString(),
+        videos: finalVideos
+    });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Backend Server running on port ${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Backend Server running on port ${PORT}`);
+    console.log(`Mode: TikWM API Aggregator (Bypasses Railway CAPTCHA)`);
 });
-
