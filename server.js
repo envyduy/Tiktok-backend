@@ -1,10 +1,9 @@
 import express from 'express';
 import cors from 'cors';
 import fs from 'fs';
-import path from 'path';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
+import fetch from 'node-fetch'; // Standard fetch, no browser required
 
 dotenv.config();
 
@@ -16,6 +15,9 @@ const HISTORY_FILE = 'tiktok_view_history.json';
 const WATCHED_USERS_FILE = 'watched_users.json';
 const TARGET_VIDEO_COUNT = 200; 
 
+// Fake User Agent to look like a real browser request
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
 app.use(cors());
 app.use(express.json());
 
@@ -23,17 +25,8 @@ app.use(express.json());
 
 const parseViewCount = (str) => {
     if (!str) return 0;
-    // Handle raw numbers (TikWM returns raw numbers mostly)
     if (typeof str === 'number') return str;
-    
-    const s = str.toString().toUpperCase().trim();
-    if (s.includes('M')) {
-        return parseFloat(s.replace('M', '')) * 1000000;
-    }
-    if (s.includes('K')) {
-        return parseFloat(s.replace('K', '')) * 1000;
-    }
-    return parseInt(s.replace(/,/g, ''), 10) || 0;
+    return parseInt(str.toString().replace(/,/g, ''), 10) || 0;
 };
 
 const formatViewCount = (num) => {
@@ -76,111 +69,110 @@ const addToWatchedUsers = (username) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- SCRAPING LOGIC (TIKWM AGGREGATOR) ---
-// Docs Reference: Public endpoints from TikWM/TikMate usually follow /api/user/posts
+// --- SCRAPING LOGIC (API BASED - NO BROWSER) ---
+// We switch from scraping HTML to using the Countik API which is friendlier to server IPs.
 
-async function fetchVideosFromTikWM(username) {
+async function fetchVideosFromApi(username) {
     let allVideos = [];
-    let cursor = 0;
+    let cursor = 0; // Countik uses numeric cursor (offset) usually, or ID based
     let hasMore = true;
     let loops = 0;
-    const MAX_LOOPS = 10; // Prevent infinite loops
+    const MAX_LOOPS = 10;
+    
+    console.log(`[API] Starting fetch for @${username}...`);
 
-    console.log(`[TikWM] Fetching videos for @${username} (Target: ${TARGET_VIDEO_COUNT})...`);
-
-    while (allVideos.length < TARGET_VIDEO_COUNT && hasMore && loops < MAX_LOOPS) {
-        loops++;
-        // Endpoint: https://www.tikwm.com/api/user/posts?unique_id={username}&count={count}&cursor={cursor}
-        const url = `https://www.tikwm.com/api/user/posts?unique_id=${username}&count=33&cursor=${cursor}`;
+    try {
+        // STEP 1: Get User ID
+        // URL: https://countik.com/api/exist/{username}
+        const userRes = await fetch(`https://countik.com/api/exist/${username}`, {
+            headers: { 'User-Agent': USER_AGENT }
+        });
         
-        try {
-            const response = await fetch(url);
-            const contentType = response.headers.get("content-type");
+        if (!userRes.ok) throw new Error(`Failed to resolve user: ${userRes.status}`);
+        const userData = await userRes.json();
+        
+        if (!userData.id) {
+            throw new Error("User not found or ID missing");
+        }
+
+        const userId = userData.id;
+        console.log(`[API] Resolved @${username} to ID: ${userId}`);
+
+        // STEP 2: Fetch Videos Loop
+        // URL: https://countik.com/api/user/posts/{user_id}?cursor={cursor}
+        
+        while (allVideos.length < TARGET_VIDEO_COUNT && hasMore && loops < MAX_LOOPS) {
+            loops++;
+            const vidUrl = `https://countik.com/api/user/posts/${userId}?cursor=${cursor}`;
             
-            if (!response.ok) {
-                console.error(`[TikWM] Error status: ${response.status}`);
+            const vidRes = await fetch(vidUrl, {
+                headers: { 'User-Agent': USER_AGENT }
+            });
+
+            if (!vidRes.ok) {
+                console.error(`[API] Error fetching videos: ${vidRes.status}`);
                 break;
             }
 
-            if (!contentType || !contentType.includes("application/json")) {
-                console.error(`[TikWM] Invalid content type. Probably rate limited.`);
-                break;
-            }
+            const vidJson = await vidRes.json();
+            const videos = vidJson.videos || [];
 
-            const json = await response.json();
-
-            if (json.code !== 0) {
-                // Code 0 usually means success
-                console.warn(`[TikWM] API returned code ${json.code}: ${json.msg}`);
-                // If user not found or private
-                if (loops === 1) throw new Error("User not found or Private");
-                break;
-            }
-
-            const data = json.data;
-            const videos = data.videos || [];
-            
             if (videos.length === 0) {
                 hasMore = false;
                 break;
             }
 
             allVideos = allVideos.concat(videos);
-            console.log(`[TikWM] Loop ${loops}: Got ${videos.length} videos. Total: ${allVideos.length}`);
+            console.log(`[API] Loop ${loops}: Got ${videos.length} videos. Total: ${allVideos.length}`);
 
-            if (data.hasMore && data.cursor) {
-                cursor = data.cursor;
-                // Important: Sleep to avoid rate limiting from the aggregator
-                await sleep(1000); 
+            if (vidJson.cursor) {
+                cursor = vidJson.cursor; // Update cursor for next page
+                await sleep(500); // Be polite
             } else {
                 hasMore = false;
             }
-
-        } catch (e) {
-            console.error(`[TikWM] Exception:`, e.message);
-            if (loops === 1) throw e;
-            break;
         }
-    }
+        
+        // --- NORMALIZE DATA ---
+        // Countik data structure -> App structure
+        const normalized = allVideos.map(v => {
+            const playCount = v.playCount || 0;
+            return {
+                id: v.id,
+                url: `https://www.tiktok.com/@${username}/video/${v.id}`,
+                cover: v.cover, // Countik provides a proxy-friendly cover URL usually
+                views: formatViewCount(playCount),
+                numericViews: playCount
+            };
+        });
 
-    // --- NORMALIZE DATA ---
-    // Map TikWM format to our App format
-    const normalized = allVideos.map(v => {
-        const playCount = v.play_count || 0;
-        return {
-            id: v.video_id || v.id, // TikWM usually uses video_id
-            url: `https://www.tiktok.com/@${username}/video/${v.video_id}`,
-            cover: v.cover || v.origin_cover, // Web compatible URL
-            views: formatViewCount(playCount),
-            numericViews: playCount
-        };
-    });
-
-    // Deduplicate based on ID just in case
-    const uniqueVideos = [];
-    const seen = new Set();
-    for (const v of normalized) {
-        if (!seen.has(v.id)) {
-            seen.add(v.id);
-            uniqueVideos.push(v);
+        // Deduplicate
+        const uniqueVideos = [];
+        const seen = new Set();
+        for (const v of normalized) {
+            if (!seen.has(v.id)) {
+                seen.add(v.id);
+                uniqueVideos.push(v);
+            }
         }
-    }
 
-    return uniqueVideos.slice(0, TARGET_VIDEO_COUNT);
+        return uniqueVideos.slice(0, TARGET_VIDEO_COUNT);
+
+    } catch (e) {
+        console.error(`[API] Exception:`, e.message);
+        throw e;
+    }
 }
 
 // --- MAIN SCRAPE HANDLER ---
 
 async function performScrape(username) {
     try {
-        // Remove '@' if present
         const cleanUser = username.replace('@', '');
-        const videos = await fetchVideosFromTikWM(cleanUser);
-        
+        const videos = await fetchVideosFromApi(cleanUser);
         return { videos, userId: cleanUser };
     } catch (e) {
         console.error(`[Scraper] Exception: ${e.message}`);
-        // Return friendly error
         return { error: e.message, videos: [] };
     }
 }
@@ -188,7 +180,9 @@ async function performScrape(username) {
 // --- CRON JOBS ---
 
 // Cron Job 1: 7:00 AM Reset (Vietnam Time)
-// Configured with timezone "Asia/Ho_Chi_Minh" to ensure correct daily reset.
+// Logic: At 7:00 AM, we fetch the current views and save them as the "Baseline".
+// Any subsequent view calculation will be (Current - Baseline).
+// This effectively resets the "Growth" counter for the new day.
 cron.schedule('0 7 * * *', async () => {
     console.log('\n[CRON] Starting Daily Morning Update (7:00 AM VN)...');
     const watched = loadJson(WATCHED_USERS_FILE);
@@ -197,14 +191,12 @@ cron.schedule('0 7 * * *', async () => {
 
     for (const user of users) {
         console.log(`[CRON-Mid] Updating baseline for: ${user}`);
-        // Add random delay to prevent rate limits
-        await sleep(Math.random() * 5000 + 2000);
+        await sleep(2000); // Small delay
         
         const result = await performScrape(user);
         if (result.videos.length > 0) {
             const newHistoryMap = {};
-            // This REPLACES the old history with current views.
-            // effectively "resetting" the counter for the new day.
+            // Set new baseline
             result.videos.forEach(v => { newHistoryMap[v.id] = v.numericViews; });
             globalHistory[user] = newHistoryMap;
         }
@@ -222,6 +214,9 @@ cron.schedule('*/30 * * * *', async () => {
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
     console.log(`[CRON-30m] Active users: ${users.length}.`);
+    // Note: We don't necessarily need to scrape here unless we want to cache data.
+    // The frontend triggers scrapes on demand, or we could auto-scrape here.
+    // For now, we just log activity.
 });
 
 // --- ROUTES ---
@@ -247,7 +242,6 @@ app.get('/views', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Username required' });
 
     const targetUsername = user.toString().replace('@', '').trim();
-    
     addToWatchedUsers(targetUsername);
 
     const globalHistory = loadJson(HISTORY_FILE);
@@ -256,31 +250,32 @@ app.get('/views', async (req, res) => {
     // CALL API
     const result = await performScrape(targetUsername);
 
-    if (result.error && (result.error.includes("User not found") || result.error.includes("Private"))) {
-        return res.status(404).json({ error: "User not found or Account is Private" });
+    if (result.error) {
+         // Fallback or error state
+        if (result.error.includes("User not found")) {
+            return res.status(404).json({ error: "User not found" });
+        }
+        return res.status(500).json({ error: "Failed to fetch data from API" });
     }
     
-    if (result.videos.length === 0 && result.error) {
-        return res.status(500).json({ error: result.error || "Failed to fetch from TikTok" });
-    }
-
     let finalVideos = result.videos;
     const isFirstTime = Object.keys(userHistory).length === 0;
     const newHistoryMap = isFirstTime ? {} : null;
 
-    // Process Change (Compare against history)
+    // Process Change
     finalVideos = finalVideos.map(video => {
         const previousViews = userHistory[video.id];
         let change = 0;
         let changePercent = 0;
 
-        // Calculate change based on the baseline set at midnight (or first load)
+        // If previousViews exists, it means we have a baseline from 7:00 AM (or whenever user was first added)
         if (previousViews !== undefined) {
             change = video.numericViews - previousViews;
             if (previousViews > 0) changePercent = (change / previousViews) * 100;
             else if (change > 0) changePercent = 100;
         }
 
+        // If this is the first time tracking this user, we build the initial history map
         if (isFirstTime && newHistoryMap) {
             newHistoryMap[video.id] = video.numericViews;
         }
@@ -292,6 +287,7 @@ app.get('/views', async (req, res) => {
         };
     });
 
+    // If first time, save the baseline immediately so next view shows 0 change until actual growth happens
     if (isFirstTime) {
         globalHistory[targetUsername] = newHistoryMap;
         saveJson(HISTORY_FILE, globalHistory);
@@ -304,7 +300,8 @@ app.get('/views', async (req, res) => {
         videos: finalVideos
     });
 });
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Backend Server running on port ${PORT}`);
-    console.log(`Mode: TikWM API Aggregator (Bypasses Railway CAPTCHA)`);
+
+app.listen(PORT, () => {
+    console.log(`Backend Server running on http://localhost:${PORT}`);
+    console.log(`Mode: Light API (Countik) - Railway Friendly`);
 });
