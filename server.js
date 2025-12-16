@@ -20,10 +20,9 @@ const PORT = process.env.PORT || 3001;
 // --- CONSTANTS ---
 const HISTORY_FILE = 'tiktok_view_history.json';
 const WATCHED_USERS_FILE = 'watched_users.json';
-const USER_DATA_DIR = path.join(process.cwd(), 'browser-profile'); 
 
-// GIẢ LẬP TRÌNH DUYỆT
-const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+// User Agent mới nhất để tránh bị phát hiện cũ
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 app.use(cors());
 app.use(express.json());
@@ -64,7 +63,7 @@ async function getBrowser() {
     if (browser) return browser;
     console.log('[System] Khởi động Browser...');
     browser = await chromium.launch({
-        headless: true, // "new" headless mode
+        headless: true,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -73,77 +72,92 @@ async function getBrowser() {
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu',
+            '--disable-blink-features=AutomationControlled', // Che giấu bot tốt hơn
         ]
     });
     return browser;
 }
 
-// --- SCRAPER LOGIC (Countik Intercept Strategy) ---
+// --- SCRAPER LOGIC (Advanced Search Flow) ---
 
 async function fetchVideosFromCountik(username) {
     const browserInstance = await getBrowser();
+    // Tạo context mới cho mỗi lần request để sạch sẽ cookie cũ
     const context = await browserInstance.newContext({
         userAgent: USER_AGENT,
-        viewport: { width: 1366, height: 768 },
-        locale: 'en-US'
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US',
+        deviceScaleFactor: 1,
     });
-    const page = await context.newPage();
     
-    // Biến chứa dữ liệu tìm thấy
+    // Thêm script để chặn phát hiện webdriver
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    });
+
+    const page = await context.newPage();
     let foundData = null;
 
     try {
-        console.log(`[Scraper] Truy cập Countik cho @${username}...`);
+        console.log(`[Scraper] Truy cập Countik (Search Mode) cho @${username}...`);
 
-        // Lắng nghe các response mạng
+        // Lắng nghe response mạng
         page.on('response', async (response) => {
             const url = response.url();
-            // Countik API thường có dạng /api/user/posts
-            if (url.includes('/api/user/posts') && response.status() === 200) {
+            // Lọc rộng hơn để bắt dính API
+            if (response.status() === 200 && (url.includes('/api/user/posts') || url.includes('/api/user/videos') || url.includes('countik.com/api/'))) {
                 try {
                     const json = await response.json();
-                    if (json && (json.posts || json.list)) {
-                        console.log('[Scraper] Đã bắt được gói tin API chứa video!');
-                        foundData = json.posts || json.list;
+                    // Kiểm tra nhiều cấu trúc JSON khác nhau
+                    const list = json.posts || json.list || json.videos || json.data?.posts;
+                    if (Array.isArray(list) && list.length > 0) {
+                        console.log(`[Scraper] Đã bắt được ${list.length} video từ API!`);
+                        foundData = list;
                     }
-                } catch (e) {
-                    // Ignore json parse errors for non-json responses
-                }
+                } catch (e) { /* ignore non-json */ }
             }
         });
 
-        // Truy cập trang Analytics của Countik
-        await page.goto(`https://countik.com/tiktok-analytics/user/${username}`, { 
-            waitUntil: 'networkidle',
-            timeout: 30000 
+        // 1. Vào trang chủ thay vì vào thẳng trang user (để tránh bị chặn direct link)
+        await page.goto('https://countik.com/tiktok-analytics', { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 60000 
         });
 
-        // Chờ thêm một chút nếu dữ liệu chưa về
-        if (!foundData) {
-            console.log('[Scraper] Đang chờ dữ liệu API...');
-            await sleep(3000); 
+        // 2. Tìm ô input và nhập username
+        // Selector có thể thay đổi nên ta dùng selector chung chung an toàn
+        const inputSelector = 'input[placeholder*="username" i], input[placeholder*="Enter TikTok" i]';
+        try {
+            await page.waitForSelector(inputSelector, { timeout: 10000 });
+            await page.fill(inputSelector, username);
+            await sleep(1000);
+            
+            // 3. Bấm Enter để tìm kiếm
+            await page.keyboard.press('Enter');
+        } catch (inputError) {
+            console.log('[Scraper] Không tìm thấy ô search, thử vào thẳng link...');
+            await page.goto(`https://countik.com/tiktok-analytics/user/${username}`, { waitUntil: 'domcontentloaded' });
         }
 
-        // Nếu vẫn không có dữ liệu, thử click nút "Check" nếu có (đôi khi cần kích hoạt)
-        if (!foundData) {
-            const checkBtn = await page.$('button#check-btn');
-            if (checkBtn) {
-                await checkBtn.click();
-                await sleep(3000);
-            }
+        // 4. Chờ dữ liệu về (Tối đa 15 giây)
+        let attempts = 0;
+        while (!foundData && attempts < 15) {
+            await sleep(1000);
+            attempts++;
+            if (attempts % 5 === 0) console.log(`[Scraper] Đang chờ dữ liệu... ${attempts}s`);
         }
 
     } catch (e) {
-        console.error(`[Scraper] Lỗi khi tải trang: ${e.message}`);
+        console.error(`[Scraper] Lỗi khi xử lý: ${e.message}`);
     } finally {
         await context.close();
     }
 
     if (!foundData || foundData.length === 0) {
-        throw new Error("Không tìm thấy dữ liệu. User có thể không tồn tại hoặc hệ thống đang bận.");
+        throw new Error("Không lấy được dữ liệu. Server bận hoặc chặn IP. Hãy thử lại sau ít phút.");
     }
 
-    // Chuẩn hóa dữ liệu từ Countik
+    // Chuẩn hóa dữ liệu
     const videos = foundData.map(v => {
         const playCount = v.play_count || v.plays || 0;
         return {
@@ -155,7 +169,6 @@ async function fetchVideosFromCountik(username) {
         };
     });
 
-    // Loại bỏ trùng lặp và null
     return videos.filter(v => v.id);
 }
 
@@ -163,7 +176,7 @@ async function fetchVideosFromCountik(username) {
 
 async function performScrape(username) {
     try {
-        const cleanUser = username.replace('@', '');
+        const cleanUser = username.replace('@', '').trim();
         const videos = await fetchVideosFromCountik(cleanUser);
         return { videos, userId: cleanUser };
     } catch (e) {
@@ -180,8 +193,7 @@ cron.schedule('0 */2 * * *', async () => {
     const globalHistory = loadJson(HISTORY_FILE);
 
     for (const user of users) {
-        // Nghỉ 10s giữa mỗi user để tránh bị chặn
-        await sleep(10000);
+        await sleep(10000); // Nghỉ giữa các user
         const result = await performScrape(user);
         if (result.videos.length > 0) {
             const newHistoryMap = {};
@@ -193,7 +205,7 @@ cron.schedule('0 */2 * * *', async () => {
 }, { scheduled: true, timezone: "Asia/Ho_Chi_Minh" });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', engine: 'Playwright + Countik' });
+    res.json({ status: 'ok', engine: 'Playwright + Countik (SearchFlow)' });
 });
 
 app.get('/watched', (req, res) => {
@@ -217,6 +229,8 @@ app.get('/views', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Username required' });
 
     const targetUsername = user.toString().replace('@', '').trim();
+    
+    // Thêm vào danh sách theo dõi ngay
     addToWatchedUsers(targetUsername);
 
     const globalHistory = loadJson(HISTORY_FILE);
@@ -225,6 +239,27 @@ app.get('/views', async (req, res) => {
     const result = await performScrape(targetUsername);
 
     if (result.error) {
+        // Nếu lỗi nhưng đã có history cũ, trả về history cũ để UI không bị trống
+        if (Object.keys(userHistory).length > 0) {
+             console.log("[Fallback] Trả về dữ liệu cũ do lỗi scrape");
+             // Giả lập video object từ history
+             const fallbackVideos = Object.entries(userHistory).map(([id, views]) => ({
+                 id,
+                 url: `https://www.tiktok.com/@${targetUsername}/video/${id}`,
+                 cover: '', // Không có cover khi fallback
+                 views: formatViewCount(views),
+                 numericViews: views,
+                 change: 0,
+                 changePercent: 0
+             }));
+             return res.json({
+                user: targetUsername,
+                totalVideos: fallbackVideos.length,
+                scrapedAt: new Date().toISOString(),
+                videos: fallbackVideos,
+                isCached: true
+            });
+        }
         return res.status(500).json({ error: result.error });
     }
 
@@ -248,10 +283,11 @@ app.get('/views', async (req, res) => {
         return { ...video, change, changePercent: parseFloat(changePercent.toFixed(2)) };
     });
 
-    if (isFirstTime) {
-        globalHistory[targetUsername] = newHistoryMap;
-        saveJson(HISTORY_FILE, globalHistory);
-    }
+    // Cập nhật history mới nhất
+    const updatedHistoryMap = {};
+    finalVideos.forEach(v => { updatedHistoryMap[v.id] = v.numericViews; });
+    globalHistory[targetUsername] = updatedHistoryMap;
+    saveJson(HISTORY_FILE, globalHistory);
 
     res.json({
         user: targetUsername,
@@ -263,6 +299,6 @@ app.get('/views', async (req, res) => {
 
 app.listen(PORT, async () => {
     console.log(`Backend chạy trên cổng ${PORT}`);
-    // Warm up browser
+    // Warm up
     getBrowser();
 });
