@@ -22,7 +22,7 @@ const HISTORY_FILE = 'tiktok_view_history.json';
 const WATCHED_USERS_FILE = 'watched_users.json';
 const MAX_VIDEOS_TO_SCRAPE = 200; // MỤC TIÊU: 200 VIDEO
 
-// User Agent mới nhất
+// User Agent giả lập thiết bị thật
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 app.use(cors());
@@ -83,11 +83,15 @@ async function getBrowser() {
 
 async function fetchVideosFromCountik(username) {
     const browserInstance = await getBrowser();
+    // Tạo context rộng hơn để giả lập màn hình desktop
     const context = await browserInstance.newContext({
         userAgent: USER_AGENT,
-        viewport: { width: 1366, height: 768 }, // Viewport laptop phổ thông
-        locale: 'en-US',
+        viewport: { width: 1920, height: 1080 },
         deviceScaleFactor: 1,
+        hasTouch: false,
+        isMobile: false,
+        locale: 'en-US',
+        permissions: ['geolocation'],
     });
     
     await context.addInitScript(() => {
@@ -103,11 +107,11 @@ async function fetchVideosFromCountik(username) {
         // Lắng nghe API response
         page.on('response', async (response) => {
             const url = response.url();
-            // Bắt tất cả các endpoint có khả năng chứa dữ liệu video
-            if (response.status() === 200 && (url.includes('/api/user/posts') || url.includes('/api/user/videos') || url.includes('countik.com/api/') || url.includes('tiktok-analytics'))) {
+            // Lọc các gói tin API
+            if (response.status() === 200 && (url.includes('/api/user/posts') || url.includes('/api/user/videos') || url.includes('countik.com/api/') || url.includes('cursor='))) {
                 try {
                     const json = await response.json();
-                    const list = json.posts || json.list || json.videos || json.data?.posts;
+                    const list = json.posts || json.list || json.videos || json.data?.posts || json.data;
                     
                     if (Array.isArray(list) && list.length > 0) {
                         let newCount = 0;
@@ -126,87 +130,92 @@ async function fetchVideosFromCountik(username) {
             }
         });
 
-        // 1. Vào trang
-        await page.goto('https://countik.com/tiktok-analytics', { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // 1. Vào trang chủ
+        await page.goto('https://countik.com/tiktok-analytics', { waitUntil: 'networkidle', timeout: 60000 });
 
-        // 2. Tìm kiếm
+        // 2. Tìm kiếm (Giả lập gõ phím)
         const inputSelector = 'input[placeholder*="username" i], input[placeholder*="Enter TikTok" i]';
         try {
-            await page.waitForSelector(inputSelector, { timeout: 10000 });
-            await page.fill(inputSelector, username);
-            await sleep(1000);
+            await page.waitForSelector(inputSelector, { timeout: 15000 });
+            await page.click(inputSelector);
+            await page.keyboard.type(username, { delay: 100 }); // Gõ chậm như người
+            await sleep(500);
             await page.keyboard.press('Enter');
         } catch (inputError) {
+            console.log('[Scraper] Fallback: Vào thẳng URL...');
             await page.goto(`https://countik.com/tiktok-analytics/user/${username}`, { waitUntil: 'domcontentloaded' });
         }
 
         // 3. Chờ mẻ dữ liệu đầu tiên
         let attempts = 0;
-        while (collectedVideos.size === 0 && attempts < 15) {
+        while (collectedVideos.size === 0 && attempts < 10) {
             await sleep(1000);
             attempts++;
         }
 
-        if (collectedVideos.size === 0) throw new Error("Không có dữ liệu ban đầu.");
+        if (collectedVideos.size === 0) {
+            // Thử reload 1 lần nếu không thấy gì
+            console.log('[Scraper] Không thấy dữ liệu, reload trang...');
+            await page.reload({ waitUntil: 'networkidle' });
+            await sleep(5000);
+        }
 
-        // 4. LOGIC CUỘN THÔNG MINH (SMART SCROLL)
-        console.log(`[Scraper] Bắt đầu cuộn sâu để lấy ${MAX_VIDEOS_TO_SCRAPE} video...`);
+        // 4. AGGRESSIVE SCROLL LOOP (Dùng chuột và phím)
+        console.log(`[Scraper] Bắt đầu cuộn sâu (Mục tiêu: ${MAX_VIDEOS_TO_SCRAPE})...`);
         
         let consecutiveNoLoad = 0;
-        const maxScrolls = 40; // Tăng số lần thử
+        const maxLoops = 50; // Tăng số lần thử
 
-        for (let i = 0; i < maxScrolls; i++) {
+        for (let i = 0; i < maxLoops; i++) {
             if (collectedVideos.size >= MAX_VIDEOS_TO_SCRAPE) break;
 
             const previousSize = collectedVideos.size;
 
-            // Kỹ thuật 1: Smooth Scroll xuống đáy (Giả lập người dùng vuốt chuột)
-            await page.evaluate(async () => {
-                await new Promise((resolve) => {
-                    let totalHeight = 0;
-                    const distance = 100; // Khoảng cách mỗi lần cuộn
-                    const timer = setInterval(() => {
-                        const scrollHeight = document.body.scrollHeight;
-                        window.scrollBy(0, distance);
-                        totalHeight += distance;
+            // ACTION 1: Di chuột vào giữa trang để đảm bảo focus
+            await page.mouse.move(960, 540);
+            
+            // ACTION 2: Cuộn mạnh bằng Mouse Wheel (Hiệu quả hơn scrollTo)
+            // Cuộn 3 lần liên tiếp
+            await page.mouse.wheel(0, 5000);
+            await sleep(500);
+            await page.mouse.wheel(0, 5000);
+            await sleep(500);
+            await page.mouse.wheel(0, 5000);
+            
+            // ACTION 3: Nhấn phím END để xuống đáy cùng
+            await page.keyboard.press('End');
 
-                        if(totalHeight >= scrollHeight){
-                            clearInterval(timer);
-                            resolve();
-                        }
-                    }, 50); // Tốc độ cuộn: 50ms/lần
-                });
-            });
+            // Chờ API phản hồi (Tối đa 4s)
+            try {
+                // Chờ xem có request API nào mới không (tùy chọn)
+                await page.waitForResponse(res => 
+                    res.url().includes('/api/') && res.status() === 200, 
+                    { timeout: 3000 }
+                ).catch(() => {}); // Bỏ qua timeout nếu không có request
+            } catch (e) {}
 
-            // Chờ tải sau khi cuộn
-            await sleep(3000);
-
-            // Kỹ thuật 2: Nếu chưa có video mới, thử bấm nút "Load More" nếu tồn tại
-            if (collectedVideos.size === previousSize) {
-                // Thử tìm nút bấm (Tiếng Anh hoặc class thường gặp)
-                const loadMoreBtn = await page.$('button:has-text("Load more"), button:has-text("Show more"), .load-more-btn');
-                if (loadMoreBtn && await loadMoreBtn.isVisible()) {
-                    console.log('[Scraper] Tìm thấy nút Load More, đang click...');
-                    await loadMoreBtn.click();
-                    await sleep(3000);
-                } else {
-                    // Kỹ thuật 3: "Jiggle" - Cuộn lên một chút rồi cuộn xuống lại để kích hoạt event
-                    await page.mouse.wheel(0, -500);
-                    await sleep(500);
-                    await page.keyboard.press('End');
-                    await sleep(2000);
-                }
+            // ACTION 4: Tìm nút "Load More" và click nếu có
+            const loadMoreBtn = await page.$('button:has-text("Load more"), .load-more, .btn-more');
+            if (loadMoreBtn && await loadMoreBtn.isVisible()) {
+                console.log('[Scraper] Bấm nút Load More...');
+                await loadMoreBtn.click();
+                await sleep(2000);
             }
 
             if (collectedVideos.size === previousSize) {
                 consecutiveNoLoad++;
-                console.log(`[Scraper] Không có video mới... (${consecutiveNoLoad}/5)`);
+                // Kỹ thuật "Jiggle": Cuộn lên một tí rồi cuộn xuống lại
+                if (consecutiveNoLoad > 2) {
+                    await page.mouse.wheel(0, -2000); // Cuộn lên
+                    await sleep(1000);
+                    await page.keyboard.press('End'); // Cuộn xuống lại
+                }
             } else {
-                consecutiveNoLoad = 0; // Reset counter
+                consecutiveNoLoad = 0;
             }
 
-            if (consecutiveNoLoad >= 5) {
-                console.log('[Scraper] Dừng cuộn do không tải thêm được dữ liệu.');
+            if (consecutiveNoLoad >= 6) {
+                console.log('[Scraper] Hết dữ liệu hoặc bị chặn (6 lần không có video mới).');
                 break;
             }
         }
@@ -217,7 +226,7 @@ async function fetchVideosFromCountik(username) {
         await context.close();
     }
 
-    if (collectedVideos.size === 0) throw new Error("Không lấy được dữ liệu.");
+    if (collectedVideos.size === 0) throw new Error("Không lấy được dữ liệu. Vui lòng thử lại.");
 
     const videos = Array.from(collectedVideos.values()).map(v => {
         const playCount = v.play_count || v.plays || 0;
@@ -231,6 +240,7 @@ async function fetchVideosFromCountik(username) {
         };
     });
 
+    // Sắp xếp video mới nhất lên đầu
     videos.sort((a, b) => b.createTime - a.createTime);
     return videos.slice(0, MAX_VIDEOS_TO_SCRAPE);
 }
@@ -248,6 +258,7 @@ async function performScrape(username) {
     }
 }
 
+// Cronjob: Cập nhật mỗi 2 giờ
 cron.schedule('0 */2 * * *', async () => {
     console.log('[CRON] Starting update...');
     const watched = loadJson(WATCHED_USERS_FILE);
@@ -267,7 +278,7 @@ cron.schedule('0 */2 * * *', async () => {
 }, { scheduled: true, timezone: "Asia/Ho_Chi_Minh" });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', engine: 'Playwright + Countik (SmartScroll)' });
+    res.json({ status: 'ok', engine: 'Playwright + Countik (AggressiveScroll)' });
 });
 
 app.get('/watched', (req, res) => {
