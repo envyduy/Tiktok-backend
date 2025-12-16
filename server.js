@@ -22,7 +22,7 @@ const HISTORY_FILE = 'tiktok_view_history.json';
 const WATCHED_USERS_FILE = 'watched_users.json';
 const MAX_VIDEOS_TO_SCRAPE = 200; // MỤC TIÊU: 200 VIDEO
 
-// User Agent mới nhất để tránh bị phát hiện cũ
+// User Agent mới nhất
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
 app.use(cors());
@@ -73,19 +73,19 @@ async function getBrowser() {
             '--no-first-run',
             '--no-zygote',
             '--disable-gpu',
-            '--disable-blink-features=AutomationControlled', // Che giấu bot tốt hơn
+            '--disable-blink-features=AutomationControlled',
         ]
     });
     return browser;
 }
 
-// --- SCRAPER LOGIC (Advanced Search Flow with Scrolling) ---
+// --- SCRAPER LOGIC ---
 
 async function fetchVideosFromCountik(username) {
     const browserInstance = await getBrowser();
     const context = await browserInstance.newContext({
         userAgent: USER_AGENT,
-        viewport: { width: 1920, height: 1080 },
+        viewport: { width: 1366, height: 768 }, // Viewport laptop phổ thông
         locale: 'en-US',
         deviceScaleFactor: 1,
     });
@@ -95,18 +95,16 @@ async function fetchVideosFromCountik(username) {
     });
 
     const page = await context.newPage();
-    
-    // Sử dụng Map để tự động loại bỏ video trùng lặp dựa trên ID
     const collectedVideos = new Map();
 
     try {
-        console.log(`[Scraper] Truy cập Countik (Search Mode) cho @${username}...`);
+        console.log(`[Scraper] Truy cập Countik cho @${username}...`);
 
-        // Lắng nghe response mạng
+        // Lắng nghe API response
         page.on('response', async (response) => {
             const url = response.url();
-            // Lọc rộng hơn để bắt dính API
-            if (response.status() === 200 && (url.includes('/api/user/posts') || url.includes('/api/user/videos') || url.includes('countik.com/api/'))) {
+            // Bắt tất cả các endpoint có khả năng chứa dữ liệu video
+            if (response.status() === 200 && (url.includes('/api/user/posts') || url.includes('/api/user/videos') || url.includes('countik.com/api/') || url.includes('tiktok-analytics'))) {
                 try {
                     const json = await response.json();
                     const list = json.posts || json.list || json.videos || json.data?.posts;
@@ -121,20 +119,17 @@ async function fetchVideosFromCountik(username) {
                             }
                         });
                         if (newCount > 0) {
-                            console.log(`[Scraper] +${newCount} video mới (Tổng: ${collectedVideos.size})`);
+                            console.log(`[Scraper] +${newCount} video (Tổng: ${collectedVideos.size})`);
                         }
                     }
-                } catch (e) { /* ignore non-json */ }
+                } catch (e) { /* ignore */ }
             }
         });
 
-        // 1. Vào trang chủ
-        await page.goto('https://countik.com/tiktok-analytics', { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 60000 
-        });
+        // 1. Vào trang
+        await page.goto('https://countik.com/tiktok-analytics', { waitUntil: 'domcontentloaded', timeout: 60000 });
 
-        // 2. Tìm ô input và nhập username
+        // 2. Tìm kiếm
         const inputSelector = 'input[placeholder*="username" i], input[placeholder*="Enter TikTok" i]';
         try {
             await page.waitForSelector(inputSelector, { timeout: 10000 });
@@ -142,70 +137,88 @@ async function fetchVideosFromCountik(username) {
             await sleep(1000);
             await page.keyboard.press('Enter');
         } catch (inputError) {
-            console.log('[Scraper] Không tìm thấy ô search, thử vào thẳng link...');
             await page.goto(`https://countik.com/tiktok-analytics/user/${username}`, { waitUntil: 'domcontentloaded' });
         }
 
-        // 3. Chờ dữ liệu ban đầu
+        // 3. Chờ mẻ dữ liệu đầu tiên
         let attempts = 0;
         while (collectedVideos.size === 0 && attempts < 15) {
             await sleep(1000);
             attempts++;
-            if (attempts % 5 === 0) console.log(`[Scraper] Đang chờ dữ liệu ban đầu... ${attempts}s`);
         }
 
-        if (collectedVideos.size === 0) {
-            throw new Error("Không tìm thấy dữ liệu ban đầu.");
-        }
+        if (collectedVideos.size === 0) throw new Error("Không có dữ liệu ban đầu.");
 
-        // 4. SCROLL LOOP - Cuộn để lấy thêm video
-        console.log(`[Scraper] Bắt đầu cuộn để lấy đủ ${MAX_VIDEOS_TO_SCRAPE} video...`);
-        let noChangeCount = 0;
-        let lastSize = 0;
-        const maxScrollAttempts = 30; // Giới hạn số lần cuộn để tránh vô tận
+        // 4. LOGIC CUỘN THÔNG MINH (SMART SCROLL)
+        console.log(`[Scraper] Bắt đầu cuộn sâu để lấy ${MAX_VIDEOS_TO_SCRAPE} video...`);
+        
+        let consecutiveNoLoad = 0;
+        const maxScrolls = 40; // Tăng số lần thử
 
-        for (let i = 0; i < maxScrollAttempts; i++) {
-            if (collectedVideos.size >= MAX_VIDEOS_TO_SCRAPE) {
-                console.log('[Scraper] Đã đạt đủ số lượng video yêu cầu.');
-                break;
+        for (let i = 0; i < maxScrolls; i++) {
+            if (collectedVideos.size >= MAX_VIDEOS_TO_SCRAPE) break;
+
+            const previousSize = collectedVideos.size;
+
+            // Kỹ thuật 1: Smooth Scroll xuống đáy (Giả lập người dùng vuốt chuột)
+            await page.evaluate(async () => {
+                await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 100; // Khoảng cách mỗi lần cuộn
+                    const timer = setInterval(() => {
+                        const scrollHeight = document.body.scrollHeight;
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+
+                        if(totalHeight >= scrollHeight){
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 50); // Tốc độ cuộn: 50ms/lần
+                });
+            });
+
+            // Chờ tải sau khi cuộn
+            await sleep(3000);
+
+            // Kỹ thuật 2: Nếu chưa có video mới, thử bấm nút "Load More" nếu tồn tại
+            if (collectedVideos.size === previousSize) {
+                // Thử tìm nút bấm (Tiếng Anh hoặc class thường gặp)
+                const loadMoreBtn = await page.$('button:has-text("Load more"), button:has-text("Show more"), .load-more-btn');
+                if (loadMoreBtn && await loadMoreBtn.isVisible()) {
+                    console.log('[Scraper] Tìm thấy nút Load More, đang click...');
+                    await loadMoreBtn.click();
+                    await sleep(3000);
+                } else {
+                    // Kỹ thuật 3: "Jiggle" - Cuộn lên một chút rồi cuộn xuống lại để kích hoạt event
+                    await page.mouse.wheel(0, -500);
+                    await sleep(500);
+                    await page.keyboard.press('End');
+                    await sleep(2000);
+                }
             }
 
-            // Cuộn xuống cuối trang
-            await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-            
-            // Chờ load dữ liệu (2 giây)
-            await sleep(2000);
-
-            // Kiểm tra xem có video mới không
-            if (collectedVideos.size === lastSize) {
-                noChangeCount++;
-                // Thử cuộn lên một chút rồi cuộn xuống lại để kích hoạt event
-                await page.mouse.wheel(0, -500);
-                await sleep(500);
-                await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+            if (collectedVideos.size === previousSize) {
+                consecutiveNoLoad++;
+                console.log(`[Scraper] Không có video mới... (${consecutiveNoLoad}/5)`);
             } else {
-                noChangeCount = 0; // Reset nếu có dữ liệu mới
-                lastSize = collectedVideos.size;
+                consecutiveNoLoad = 0; // Reset counter
             }
 
-            // Nếu 4 lần liên tiếp không có video mới -> Đã hết video
-            if (noChangeCount >= 4) {
-                console.log('[Scraper] Không tìm thấy thêm video mới sau nhiều lần cuộn.');
+            if (consecutiveNoLoad >= 5) {
+                console.log('[Scraper] Dừng cuộn do không tải thêm được dữ liệu.');
                 break;
             }
         }
 
     } catch (e) {
-        console.error(`[Scraper] Lỗi khi xử lý: ${e.message}`);
+        console.error(`[Scraper] Lỗi: ${e.message}`);
     } finally {
         await context.close();
     }
 
-    if (collectedVideos.size === 0) {
-        throw new Error("Không lấy được dữ liệu. Server bận hoặc chặn IP.");
-    }
+    if (collectedVideos.size === 0) throw new Error("Không lấy được dữ liệu.");
 
-    // Chuẩn hóa dữ liệu
     const videos = Array.from(collectedVideos.values()).map(v => {
         const playCount = v.play_count || v.plays || 0;
         return {
@@ -214,16 +227,11 @@ async function fetchVideosFromCountik(username) {
             cover: v.cover || v.origin_cover || v.thumbnail_url,
             views: formatViewCount(playCount),
             numericViews: playCount,
-            // Thêm timestamp để sort nếu có
             createTime: v.create_time || 0 
         };
     });
 
-    // Sắp xếp theo thời gian mới nhất (nếu API trả về có create_time, thường là có)
-    // Nếu không có create_time, danh sách thường đã theo thứ tự rồi.
     videos.sort((a, b) => b.createTime - a.createTime);
-
-    // Cắt đúng 200 video (hoặc ít hơn nếu không đủ)
     return videos.slice(0, MAX_VIDEOS_TO_SCRAPE);
 }
 
@@ -240,15 +248,14 @@ async function performScrape(username) {
     }
 }
 
-// Cronjob: Cập nhật mỗi 2 giờ
 cron.schedule('0 */2 * * *', async () => {
-    console.log('[CRON] Bắt đầu cập nhật dữ liệu...');
+    console.log('[CRON] Starting update...');
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
     const globalHistory = loadJson(HISTORY_FILE);
 
     for (const user of users) {
-        await sleep(10000); // Nghỉ giữa các user
+        await sleep(10000);
         const result = await performScrape(user);
         if (result.videos.length > 0) {
             const newHistoryMap = {};
@@ -260,7 +267,7 @@ cron.schedule('0 */2 * * *', async () => {
 }, { scheduled: true, timezone: "Asia/Ho_Chi_Minh" });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', engine: 'Playwright + Countik (DeepScroll)' });
+    res.json({ status: 'ok', engine: 'Playwright + Countik (SmartScroll)' });
 });
 
 app.get('/watched', (req, res) => {
@@ -284,7 +291,6 @@ app.get('/views', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Username required' });
 
     const targetUsername = user.toString().replace('@', '').trim();
-    
     addToWatchedUsers(targetUsername);
 
     const globalHistory = loadJson(HISTORY_FILE);
@@ -294,7 +300,7 @@ app.get('/views', async (req, res) => {
 
     if (result.error) {
         if (Object.keys(userHistory).length > 0) {
-             console.log("[Fallback] Trả về dữ liệu cũ do lỗi scrape");
+             console.log("[Fallback] Returning cached data");
              const fallbackVideos = Object.entries(userHistory).map(([id, views]) => ({
                  id,
                  url: `https://www.tiktok.com/@${targetUsername}/video/${id}`,
