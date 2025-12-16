@@ -20,31 +20,15 @@ const PORT = process.env.PORT || 3001;
 // --- CONSTANTS ---
 const HISTORY_FILE = 'tiktok_view_history.json';
 const WATCHED_USERS_FILE = 'watched_users.json';
-const TARGET_VIDEO_COUNT = 200; 
-const USER_DATA_DIR = path.join(process.cwd(), 'tikwm-profile'); 
+const USER_DATA_DIR = path.join(process.cwd(), 'browser-profile'); 
 
-// GIẢ LẬP TRÌNH DUYỆT WINDOWS 10
+// GIẢ LẬP TRÌNH DUYỆT
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
 app.use(cors());
 app.use(express.json());
 
-// --- TRẠNG THÁI TOÀN CỤC ---
-let browserContext = null;
-let mainPage = null;
-let isBrowserReady = false; 
-
-// --- Helper Functions: Utils ---
-
-const parseViewCount = (str) => {
-    if (!str) return 0;
-    if (typeof str === 'number') return str;
-    const s = str.toString().toUpperCase().trim();
-    if (s.includes('M')) return parseFloat(s.replace('M', '')) * 1000000;
-    if (s.includes('K')) return parseFloat(s.replace('K', '')) * 1000;
-    return parseInt(s.replace(/,/g, ''), 10) || 0;
-};
-
+// --- UTILS ---
 const formatViewCount = (num) => {
     if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
     if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
@@ -73,257 +57,106 @@ const addToWatchedUsers = (username) => {
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- LOGIC XỬ LÝ CLOUDFLARE ---
+// --- BROWSER MANAGER ---
+let browser = null;
 
-async function solveCloudflare(page) {
-    console.log('>>> [Solver] Đang tìm cách vượt Cloudflare...');
-    await sleep(3000);
-
-    try {
-        const frames = page.frames();
-        const challengeFrame = frames.find(f => f.url().includes('challenge-platform'));
-
-        if (challengeFrame) {
-            console.log('>>> [Solver] Đã tìm thấy khung bảo mật (Iframe).');
-            
-            // Cách 1: Tìm nút checkbox
-            const checkbox = await challengeFrame.waitForSelector('input[type="checkbox"], .ctp-checkbox-label', { timeout: 3000 }).catch(() => null);
-            if (checkbox) {
-                console.log('>>> [Solver] Click vào Checkbox...');
-                await checkbox.click({ force: true });
-            } else {
-                // Cách 2: Click vào giữa iframe (tọa độ)
-                console.log('>>> [Solver] Không thấy nút, click vào giữa khung...');
-                const box = await challengeFrame.boundingBox();
-                if (box) {
-                    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-                }
-            }
-            
-            await sleep(5000); // Chờ reload
-            return true;
-        } else {
-            console.log('>>> [Solver] Không tìm thấy Iframe. Có thể đã qua hoặc bị chặn kiểu khác.');
-        }
-    } catch (e) {
-        console.log(`>>> [Solver] Lỗi: ${e.message}`);
-    }
+async function getBrowser() {
+    if (browser) return browser;
+    console.log('[System] Khởi động Browser...');
+    browser = await chromium.launch({
+        headless: true, // "new" headless mode
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu',
+        ]
+    });
+    return browser;
 }
 
-// --- KHỞI TẠO TRÌNH DUYỆT ---
+// --- SCRAPER LOGIC (Countik Intercept Strategy) ---
 
-async function initBrowser() {
-    if (browserContext) return;
-
-    console.log('[System] Khởi tạo trình duyệt ẩn danh (Stealth Mode)...');
-    isBrowserReady = false;
+async function fetchVideosFromCountik(username) {
+    const browserInstance = await getBrowser();
+    const context = await browserInstance.newContext({
+        userAgent: USER_AGENT,
+        viewport: { width: 1366, height: 768 },
+        locale: 'en-US'
+    });
+    const page = await context.newPage();
     
-    if (!fs.existsSync(USER_DATA_DIR)) {
-        try { fs.mkdirSync(USER_DATA_DIR, { recursive: true }); } catch (e) {}
-    }
+    // Biến chứa dữ liệu tìm thấy
+    let foundData = null;
 
     try {
-        browserContext = await chromium.launchPersistentContext(USER_DATA_DIR, {
-            headless: true, // BẮT BUỘC TRÊN RAILWAY
-            viewport: { width: 1366, height: 768 },
-            userAgent: USER_AGENT,
-            locale: 'en-US',
-            timezoneId: 'Asia/Ho_Chi_Minh',
-            args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-blink-features=AutomationControlled', // Quan trọng: Giấu việc đang dùng bot
-            ],
-            ignoreDefaultArgs: ['--enable-automation']
+        console.log(`[Scraper] Truy cập Countik cho @${username}...`);
+
+        // Lắng nghe các response mạng
+        page.on('response', async (response) => {
+            const url = response.url();
+            // Countik API thường có dạng /api/user/posts
+            if (url.includes('/api/user/posts') && response.status() === 200) {
+                try {
+                    const json = await response.json();
+                    if (json && (json.posts || json.list)) {
+                        console.log('[Scraper] Đã bắt được gói tin API chứa video!');
+                        foundData = json.posts || json.list;
+                    }
+                } catch (e) {
+                    // Ignore json parse errors for non-json responses
+                }
+            }
         });
 
-        const pages = browserContext.pages();
-        mainPage = pages.length > 0 ? pages[0] : await browserContext.newPage();
+        // Truy cập trang Analytics của Countik
+        await page.goto(`https://countik.com/tiktok-analytics/user/${username}`, { 
+            waitUntil: 'networkidle',
+            timeout: 30000 
+        });
 
-        // --- XỬ LÝ COOKIE TỪ BIẾN MÔI TRƯỜNG ---
-        if (process.env.TIKWM_COOKIE) {
-            console.log('[System] Đang nạp Cookie từ biến môi trường...');
-            
-            // 1. Làm sạch chuỗi cookie (xóa dấu nháy thừa nếu có)
-            let cookieString = process.env.TIKWM_COOKIE.trim();
-            if ((cookieString.startsWith('"') && cookieString.endsWith('"')) || 
-                (cookieString.startsWith("'") && cookieString.endsWith("'"))) {
-                cookieString = cookieString.slice(1, -1);
-            }
-
-            // 2. Chuyển đổi thành mảng object
-            const cookies = cookieString.split(';').map(pair => {
-                const parts = pair.trim().split('=');
-                if (parts.length < 2) return null;
-                const name = parts[0].trim();
-                const value = parts.slice(1).join('=').trim();
-                return { name, value, domain: '.tikwm.com', path: '/' };
-            }).filter(c => c !== null);
-
-            // 3. Kiểm tra xem có cf_clearance không
-            const hasClearance = cookies.some(c => c.name === 'cf_clearance');
-            if (!hasClearance) {
-                console.warn('\n⚠️  CẢNH BÁO QUAN TRỌNG: Cookie bạn nhập THIẾU "cf_clearance"!');
-                console.warn('⚠️  Cloudflare thường yêu cầu cookie này để xác minh bạn là người.');
-                console.warn('⚠️  Hãy lấy lại cookie từ trình duyệt (Tab Network -> Headers).\n');
-            } else {
-                console.log('✅  Đã tìm thấy "cf_clearance". Hy vọng sẽ qua được Cloudflare.');
-            }
-
-            await browserContext.addCookies(cookies);
+        // Chờ thêm một chút nếu dữ liệu chưa về
+        if (!foundData) {
+            console.log('[Scraper] Đang chờ dữ liệu API...');
+            await sleep(3000); 
         }
 
-        console.log('[System] Truy cập TikWM...');
-        await mainPage.goto('https://www.tikwm.com/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-
-        // --- KIỂM TRA & GIẢI QUYẾT CLOUDFLARE ---
-        let attempts = 0;
-        while (attempts < 3) {
-            const title = await mainPage.title();
-            console.log(`[System] Kiểm tra lần ${attempts + 1}: Tiêu đề trang là "${title}"`);
-
-            if (title.includes("Just a moment") || title.includes("Security") || title.includes("Cloudflare")) {
-                await solveCloudflare(mainPage);
-                await sleep(3000); 
-            } else {
-                console.log('[System] ✅ Đã vào được trang chính TikWM.');
-                isBrowserReady = true;
-                return;
-            }
-            attempts++;
-            // Thử reload lại trang để cookie ăn vào
-            await mainPage.reload({ waitUntil: 'domcontentloaded' });
-            await sleep(5000);
-        }
-
-        console.error('[System] ❌ Không thể vượt Cloudflare sau 3 lần thử.');
-        console.error('[System] GỢI Ý: Hãy cập nhật lại TIKWM_COOKIE mới nhất (nhớ lấy cả cf_clearance).');
-        isBrowserReady = false; 
-
-    } catch (e) {
-        console.error('[System] Lỗi khởi tạo trình duyệt:', e);
-        browserContext = null;
-    }
-}
-
-// --- LOGIC CÀO DỮ LIỆU ---
-
-async function fetchVideosFromTikWM(username) {
-    // Nếu chưa sẵn sàng, thử khởi động lại
-    if (!isBrowserReady) {
-        if (!browserContext) await initBrowser();
-        if (!isBrowserReady) {
-             const title = await mainPage?.title() || "";
-             if (!title.includes("Just a moment")) isBrowserReady = true;
-             else throw new Error("Hệ thống đang bận vượt Cloudflare. Vui lòng thử lại sau 30s.");
-        }
-    }
-
-    let allVideos = [];
-    let cursor = 0;
-    let hasMore = true;
-    let loops = 0;
-    const MAX_LOOPS = 10;
-
-    console.log(`[Scraper] Đang lấy dữ liệu cho @${username}...`);
-
-    try {
-        while (allVideos.length < TARGET_VIDEO_COUNT && hasMore && loops < MAX_LOOPS) {
-            loops++;
-            const apiUrl = `https://www.tikwm.com/api/user/posts?unique_id=${username}&count=33&cursor=${cursor}`;
-            
-            const json = await mainPage.evaluate(async (url) => {
-                try {
-                    // Delay ngẫu nhiên để giống người thật
-                    await new Promise(r => setTimeout(r, Math.random() * 500 + 200));
-                    
-                    const res = await fetch(url, {
-                        headers: {
-                            'Referer': 'https://www.tikwm.com/',
-                            'User-Agent': navigator.userAgent,
-                            'X-Requested-With': 'XMLHttpRequest' // Quan trọng cho API
-                        }
-                    });
-                    
-                    // Nếu trả về HTML -> Bị chặn
-                    const contentType = res.headers.get('content-type');
-                    if (contentType && contentType.includes('text/html')) {
-                        return { code: -999, msg: "CLOUDFLARE_BLOCK" };
-                    }
-                    return await res.json();
-                } catch (err) {
-                    return null;
-                }
-            }, apiUrl);
-
-            if (!json) {
-                console.warn('[Scraper] Lỗi mạng nội bộ trình duyệt.');
-                break;
-            }
-
-            if (json.code === -999) {
-                 isBrowserReady = false;
-                 throw new Error("Phiên làm việc hết hạn. Cần cập nhật Cookie mới.");
-            }
-
-            if (json.code !== 0) {
-                if (loops === 1) throw new Error("Không tìm thấy user hoặc tài khoản Private");
-                break;
-            }
-
-            const data = json.data;
-            const videos = data.videos || [];
-            if (videos.length === 0) {
-                hasMore = false;
-                break;
-            }
-
-            allVideos = allVideos.concat(videos);
-            if (data.hasMore && data.cursor) {
-                cursor = data.cursor;
-                await sleep(1500 + Math.random() * 1000); 
-            } else {
-                hasMore = false;
+        // Nếu vẫn không có dữ liệu, thử click nút "Check" nếu có (đôi khi cần kích hoạt)
+        if (!foundData) {
+            const checkBtn = await page.$('button#check-btn');
+            if (checkBtn) {
+                await checkBtn.click();
+                await sleep(3000);
             }
         }
 
     } catch (e) {
-        console.error(`[Scraper] Lỗi: ${e.message}`);
-        if (e.message.includes("Phiên làm việc") || e.message.includes("Cloudflare")) {
-            isBrowserReady = false; // Đánh dấu để lần sau init lại
-            setTimeout(() => initBrowser(), 1000); // Thử kết nối lại ngầm
-        }
-        throw e;
+        console.error(`[Scraper] Lỗi khi tải trang: ${e.message}`);
+    } finally {
+        await context.close();
     }
 
-    // Chuẩn hóa dữ liệu
-    const normalized = allVideos.map(v => {
-        const playCount = v.play_count || 0;
+    if (!foundData || foundData.length === 0) {
+        throw new Error("Không tìm thấy dữ liệu. User có thể không tồn tại hoặc hệ thống đang bận.");
+    }
+
+    // Chuẩn hóa dữ liệu từ Countik
+    const videos = foundData.map(v => {
+        const playCount = v.play_count || v.plays || 0;
         return {
-            id: v.video_id || v.id,
-            url: `https://www.tiktok.com/@${username}/video/${v.video_id}`,
-            cover: v.cover || v.origin_cover,
+            id: v.id || v.video_id,
+            url: `https://www.tiktok.com/@${username}/video/${v.id || v.video_id}`,
+            cover: v.cover || v.origin_cover || v.thumbnail_url,
             views: formatViewCount(playCount),
             numericViews: playCount
         };
     });
 
-    // Lọc trùng
-    const uniqueVideos = [];
-    const seen = new Set();
-    for (const v of normalized) {
-        if (!seen.has(v.id)) {
-            seen.add(v.id);
-            uniqueVideos.push(v);
-        }
-    }
-
-    return uniqueVideos.slice(0, TARGET_VIDEO_COUNT);
+    // Loại bỏ trùng lặp và null
+    return videos.filter(v => v.id);
 }
 
 // --- API ROUTES ---
@@ -331,21 +164,24 @@ async function fetchVideosFromTikWM(username) {
 async function performScrape(username) {
     try {
         const cleanUser = username.replace('@', '');
-        const videos = await fetchVideosFromTikWM(cleanUser);
+        const videos = await fetchVideosFromCountik(cleanUser);
         return { videos, userId: cleanUser };
     } catch (e) {
+        console.error(e);
         return { error: e.message, videos: [] };
     }
 }
 
-cron.schedule('0 7 * * *', async () => {
-    console.log('[CRON] Cập nhật dữ liệu buổi sáng...');
+// Cronjob: Cập nhật mỗi 2 giờ
+cron.schedule('0 */2 * * *', async () => {
+    console.log('[CRON] Bắt đầu cập nhật dữ liệu...');
     const watched = loadJson(WATCHED_USERS_FILE);
     const users = watched.list || [];
     const globalHistory = loadJson(HISTORY_FILE);
 
     for (const user of users) {
-        await sleep(Math.random() * 5000 + 2000);
+        // Nghỉ 10s giữa mỗi user để tránh bị chặn
+        await sleep(10000);
         const result = await performScrape(user);
         if (result.videos.length > 0) {
             const newHistoryMap = {};
@@ -356,18 +192,8 @@ cron.schedule('0 7 * * *', async () => {
     saveJson(HISTORY_FILE, globalHistory);
 }, { scheduled: true, timezone: "Asia/Ho_Chi_Minh" });
 
-cron.schedule('*/30 * * * *', async () => {
-    console.log('[CRON] Giữ server hoạt động (30p)...');
-    loadJson(WATCHED_USERS_FILE);
-});
-
-app.get('/health', async (req, res) => {
-    const title = mainPage ? await mainPage.title() : "No Browser";
-    res.json({ 
-        status: 'ok', 
-        browserReady: isBrowserReady, 
-        currentTitle: title 
-    });
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', engine: 'Playwright + Countik' });
 });
 
 app.get('/watched', (req, res) => {
@@ -399,8 +225,7 @@ app.get('/views', async (req, res) => {
     const result = await performScrape(targetUsername);
 
     if (result.error) {
-        const status = result.error.includes("Không tìm thấy") ? 404 : 500;
-        return res.status(status).json({ error: result.error });
+        return res.status(500).json({ error: result.error });
     }
 
     let finalVideos = result.videos;
@@ -437,6 +262,7 @@ app.get('/views', async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-    console.log(`Backend chạy trên cổng ${PORT} | Headless: TRUE | Stealth: BẬT`);
-    await initBrowser();
+    console.log(`Backend chạy trên cổng ${PORT}`);
+    // Warm up browser
+    getBrowser();
 });
