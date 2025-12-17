@@ -403,6 +403,6 @@ app.get('/views', async (req, res) => {
     });
 });
 
-app.listen(PORT, async () => {
-    console.log(`Backend running on port ${PORT} (Direct API + Playwright Captcha Solver)`);
+app.listen(PORT, '0.0.0.0', async () => {
+    console.log(`Backend running on http://0.0.0.0:${PORT}`);
 });
