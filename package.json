@@ -4,16 +4,14 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^5.2.1",
     "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2",
-    "playwright": "^1.42.1",
+    "playwright": "^1.50.1",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
