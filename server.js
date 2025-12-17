@@ -89,18 +89,22 @@ async function fetchVideosViaBrowser(inputUsername, forceHeadful = false) {
             const url = `https://www.tikwm.com/api/user/posts?unique_id=${targetId}&count=33&cursor=${cursor}`;
             console.log(`🌐 Truy cập: ${url}`);
             
-            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
             
             let data = await getJsonFromPage(page);
 
+            // Nếu không có data (có thể bị CAPTCHA)
             if (!data) {
                 if (!forceHeadful) {
-                    console.log("⚠️ [BỊ CHẶN] Cần giải CAPTCHA...");
+                    console.log("⚠️ [BỊ CHẶN] Cần giải CAPTCHA. Đang chuyển sang chế độ hiện...");
                     await context.close();
-                    return await fetchVideosViaBrowser(inputUsername, true); 
+                    return await fetchVideosViaBrowser(inputUsername, true); // Gọi lại chính nó ở chế độ hiện
                 } else {
-                    console.log("🧩 [CAPTCHA] Đang đợi bạn giải...");
-                    await page.waitForFunction(() => document.body.innerText.includes('"code":0'), { timeout: 120000 });
+                    console.log("🧩 [CAPTCHA] Đang đợi bạn giải CAPTCHA...");
+                    // Đợi đến khi JSON xuất hiện
+                    await page.waitForFunction(() => {
+                        return document.body.innerText.includes('"code":0');
+                    }, { timeout: 120000 });
                     data = await getJsonFromPage(page);
                 }
             }
@@ -113,18 +117,36 @@ async function fetchVideosViaBrowser(inputUsername, forceHeadful = false) {
                 console.log(`   -> Lấy được ${vids.length} videos (Tổng: ${allVideos.length})`);
                 
                 if (!hasMore || allVideos.length >= TARGET_VIDEO_COUNT) break;
-                await sleep(1500); 
+                
+                // Nghỉ ngắn giữa các lần chuyển trang để tránh bị phát hiện spam
+                await sleep(2000); 
             } else {
+                console.log("⚠️ API không trả về dữ liệu hợp lệ.");
                 break;
             }
         }
+
     } catch (e) {
         console.error("❌ Lỗi quét:", e.message);
     } finally {
-        if (context) await context.close();
+        if (context) {
+            console.log("✅ Hoàn tất. Đóng trình duyệt.");
+            await context.close();
+        }
     }
 
-    return { rawVideos: allVideos, userId: targetId };
+    if (allVideos.length === 0) throw new Error("Không lấy được dữ liệu video.");
+
+    const processed = allVideos.map(v => ({
+        id: v.video_id,
+        url: `https://www.tiktok.com/@${targetId}/video/${v.video_id}`,
+        cover: v.cover || v.origin_cover, 
+        views: formatViewCount(v.play_count),
+        numericViews: v.play_count,
+        createTime: v.create_time
+    }));
+
+    return { videos: processed.slice(0, TARGET_VIDEO_COUNT), userId: targetId };
 }
 
 // --- API ROUTES ---
@@ -143,7 +165,6 @@ app.get('/views', async (req, res) => {
     if (!user) return res.status(400).json({ error: 'Username required' });
     const target = user.toString().replace('@', '').trim();
     
-    // 1. Quản lý danh sách theo dõi
     const watched = loadJson(WATCHED_USERS_FILE);
     if (!Array.isArray(watched.list)) watched.list = [];
     if (!watched.list.includes(target)) {
@@ -151,72 +172,36 @@ app.get('/views', async (req, res) => {
         saveJson(WATCHED_USERS_FILE, watched);
     }
 
-    // 2. Tải Cache
     const globalHistory = loadJson(HISTORY_FILE);
-    // Cấu trúc mới: { views: number, cover: string, lastUpdated: string }
-    const userCache = globalHistory[target] || {}; 
+    const userHistory = globalHistory[target] || {}; 
     
     try {
-        // 3. Quét dữ liệu mới
-        const { rawVideos } = await fetchVideosViaBrowser(target);
+        const result = await fetchVideosViaBrowser(target);
+        const isFirstTime = Object.keys(userHistory).length === 0;
         
-        // 4. Cập nhật Cache với dữ liệu mới
-        rawVideos.forEach(v => {
-            userCache[v.video_id] = {
-                views: v.play_count,
-                cover: v.cover || v.origin_cover,
-                lastUpdated: new Date().toISOString()
-            };
+        const finalVideos = result.videos.map(video => {
+            const prev = userHistory[video.id];
+            let change = 0, changePercent = 0;
+            if (prev !== undefined) {
+                change = video.numericViews - prev;
+                if (prev > 0) changePercent = (change / prev) * 100;
+            }
+            if (isFirstTime) userHistory[video.id] = video.numericViews;
+            return { ...video, change, changePercent: parseFloat(changePercent.toFixed(2)) };
         });
 
-        // 5. Tổng hợp dữ liệu để gửi về Frontend
-        // Lấy tất cả video từ cache, sắp xếp theo thời gian hoặc ID (để video mới lên đầu)
-        // Chúng ta map ngược lại từ cache để đảm bảo kể cả khi scraper lỗi, ta vẫn có data cũ.
-        let finalVideos = Object.entries(userCache).map(([id, info]) => {
-            const videoId = id;
-            const numericViews = info.views;
-            
-            // Tính toán thay đổi (nếu có dữ liệu cũ trong RAM trước khi cập nhật - logic này cần tinh tế hơn)
-            // Ở đây ta so sánh với chính nó nhưng là dữ liệu "trước khi scan" nếu muốn
-            // Để đơn giản, ta sẽ chỉ trả về danh sách đã merge.
-            
-            return {
-                id: videoId,
-                url: `https://www.tiktok.com/@${target}/video/${videoId}`,
-                cover: info.cover,
-                views: formatViewCount(numericViews),
-                numericViews: numericViews,
-                // Change logic will be handled by comparing current vs previous in a real app
-                // For now, let's keep the existing change logic if possible
-            };
-        });
+        if (isFirstTime) {
+            globalHistory[target] = userHistory;
+            saveJson(HISTORY_FILE, globalHistory);
+        }
 
-        // Sắp xếp video mới nhất lên đầu (Dựa trên ID hoặc bạn có thể lưu timestamp)
-        finalVideos.sort((a, b) => b.id.localeCompare(a.id));
-
-        // Lưu lại cache đã cập nhật
-        globalHistory[target] = userCache;
-        saveJson(HISTORY_FILE, globalHistory);
-
-        res.json({ 
-            user: target, 
-            totalVideos: finalVideos.length, 
-            scrapedAt: new Date().toISOString(), 
-            videos: finalVideos.slice(0, TARGET_VIDEO_COUNT) 
-        });
-
+        res.json({ user: target, totalVideos: finalVideos.length, scrapedAt: new Date().toISOString(), videos: finalVideos });
     } catch (err) {
-        console.error(err);
-        // Nếu lỗi hoàn toàn, trả về toàn bộ cache cũ
-        if (Object.keys(userCache).length > 0) {
-            const fallback = Object.entries(userCache).map(([id, info]) => ({
-                id, 
-                url: `https://www.tiktok.com/@${target}/video/${id}`,
-                cover: info.cover, 
-                views: formatViewCount(info.views), 
-                numericViews: info.views
-            })).sort((a, b) => b.id.localeCompare(a.id));
-            
+        if (Object.keys(userHistory).length > 0) {
+            const fallback = Object.entries(userHistory).map(([id, views]) => ({
+                id, url: `https://www.tiktok.com/@${target}/video/${id}`,
+                cover: '', views: formatViewCount(views), numericViews: views, change: 0
+            }));
             return res.json({ user: target, videos: fallback, isCached: true, error: err.message });
         }
         res.status(500).json({ error: err.message });
@@ -230,16 +215,10 @@ cron.schedule('*/30 * * * *', async () => {
     const globalHistory = loadJson(HISTORY_FILE);
     for (const user of (watched.list || [])) {
         try {
-            const { rawVideos } = await fetchVideosViaBrowser(user);
-            const userCache = globalHistory[user] || {};
-            rawVideos.forEach(v => {
-                userCache[v.video_id] = {
-                    views: v.play_count,
-                    cover: v.cover || v.origin_cover,
-                    lastUpdated: new Date().toISOString()
-                };
-            });
-            globalHistory[user] = userCache;
+            const result = await fetchVideosViaBrowser(user);
+            const map = globalHistory[user] || {};
+            result.videos.forEach(v => { map[v.id] = v.numericViews; });
+            globalHistory[user] = map;
             saveJson(HISTORY_FILE, globalHistory);
         } catch (e) {}
         await sleep(5000);
