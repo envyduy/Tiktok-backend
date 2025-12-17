@@ -17,7 +17,11 @@ const WATCHED_USERS_FILE = 'watched_users.json';
 const USER_DATA_DIR = path.join(process.cwd(), 'user_data_v2'); 
 const TARGET_VIDEO_COUNT = 200;
 
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(express.json());
 
 // --- UTILS ---
@@ -117,7 +121,7 @@ async function solveCloudflare(page) {
     console.log("⚡ [Solver] Bắt đầu quy trình giả lập Tab + Space...");
     // Click vào vùng trống để focus window
     await page.mouse.click(50, 50).catch(() => {});
-    await sleep(1000);
+    await sleep(4000);
 
     for (let i = 1; i <= 3; i++) {
         console.log(`   👉 [Thử lần ${i}] Gửi Tab + Space...`);
